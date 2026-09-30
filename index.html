@@ -2969,6 +2969,552 @@ testPushButton.onclick = async () => {
     testPushButton.textContent = "🔔 اختبار الإشعارات";
   }
 };
+
+// ربط المكالمات بطلبات Firestore وإشعارات Cloudflare.
+import {
+  query as callQuery,
+  where as callWhere
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
+
+const CALL_SERVICE =
+  "https://little-poetry-7913mokalamati-notifications.ah10med2013.workers.dev";
+
+const cloudRequests = new Map();
+const cloudWakeTimes = new Map();
+const cloudDismissed = new Map();
+
+let cloudUnsubscribe = null;
+let cloudInterval = null;
+let cloudWatchingUID = null;
+let cloudChecking = false;
+
+async function callService(
+  path,
+  data,
+  account = auth.currentUser
+) {
+  if (!account) {
+    throw new Error("سجّل الدخول أولًا.");
+  }
+
+  const idToken = await account.getIdToken();
+
+  const response = await fetch(
+    CALL_SERVICE + path,
+    {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + idToken,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(data),
+      keepalive: path === "/cancel"
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result.error ||
+      "تعذر ربط المكالمة بالإشعار."
+    );
+  }
+
+  return result;
+}
+
+function dismissCloudCall(id) {
+  if (!id) return;
+
+  const expiry = Date.now() + 120000;
+  cloudDismissed.set(id, expiry);
+
+  try {
+    sessionStorage.setItem(
+      "mokalamati-dismissed-" +
+      auth.currentUser?.uid + "-" + id,
+      String(expiry)
+    );
+  } catch {}
+}
+
+function cloudCallDismissed(id) {
+  let expiry = cloudDismissed.get(id) || 0;
+
+  try {
+    expiry = Math.max(
+      expiry,
+      Number(
+        sessionStorage.getItem(
+          "mokalamati-dismissed-" +
+          auth.currentUser?.uid + "-" + id
+        )
+      ) || 0
+    );
+  } catch {}
+
+  return expiry > Date.now();
+}
+
+// عدم تكرار عرض الدعوة بعد رفضها.
+const originalRejectIncoming = rejectIncoming;
+
+rejectIncoming = function(notify = true) {
+  if (incoming) {
+    dismissCloudCall(incoming.id);
+  }
+
+  return originalRejectIncoming(notify);
+};
+
+// إلغاء الطلب المحفوظ عندما ينهي المتصل المكالمة.
+const originalEndCall = endCall;
+
+endCall = function(notify = true) {
+  const previous = session;
+
+  if (previous) {
+    dismissCloudCall(previous.id);
+  }
+
+  originalEndCall(notify);
+
+  if (previous?.cloudOwnerUID) {
+    Promise.resolve(previous.cloudPending)
+      .catch(() => {})
+      .then(() =>
+        callService(
+          "/cancel",
+          { id: previous.id },
+          previous.cloudAccount
+        )
+      )
+      .catch(() => {});
+  }
+};
+
+// بدء الاتصال من خلال الطلب المحفوظ.
+startCall = async function(mode, handles) {
+  let current = null;
+
+  try {
+    if (
+      !user ||
+      !profile ||
+      !peer?.open ||
+      !$("status").textContent?.includes(
+        "متصل وجاهز"
+      )
+    ) {
+      throw new Error(
+        "انتظر ظهور متصل وجاهز للمكالمات."
+      );
+    }
+
+    if (session || incoming) {
+      throw new Error(
+        "أنهِ المكالمة الحالية أولًا."
+      );
+    }
+
+    const names = [
+      ...new Set(handles.map(username))
+    ];
+
+    if (
+      !names.length ||
+      names.length > 5 ||
+      names.some(name => !validUsername(name))
+    ) {
+      throw new Error(
+        "اكتب من اسم مستخدم واحد إلى خمسة أسماء صحيحة."
+      );
+    }
+
+    if (names.includes(profile.username)) {
+      throw new Error(
+        "لا يمكنك الاتصال بنفسك."
+      );
+    }
+
+    const token = ++mediaEpoch;
+    const account = auth.currentUser;
+
+    current = {
+      id: crypto.randomUUID(),
+      mode,
+      host: peer.id,
+      isGroup: names.length > 1,
+      members: [self()],
+      invited: [],
+      timeout: null,
+      cloudOwnerUID: user.uid,
+      cloudAccount: account,
+      cloudPending: null,
+      expiresAt: Date.now() + 90000
+    };
+
+    session = current;
+    departed.clear();
+
+    showScreen("جاري تجهيز المكالمة…");
+
+    const targets = await Promise.all(
+      names.map(findPerson)
+    );
+
+    if (
+      session !== current ||
+      token !== mediaEpoch
+    ) {
+      return;
+    }
+
+    current.invited = targets;
+
+    await acquire(mode, token);
+
+    if (
+      session !== current ||
+      token !== mediaEpoch
+    ) {
+      return;
+    }
+
+    showScreen(
+      current.isGroup
+        ? "👥 مكالمة جماعية"
+        : "مكالمة مع @" + targets[0].username
+    );
+
+    $("callState").textContent =
+      "جارٍ حفظ الطلب وإرسال الإشعار…";
+
+    current.cloudPending = callService(
+      "/invite",
+      {
+        id: current.id,
+        mode,
+        usernames: names
+      },
+      account
+    );
+
+    const result = await current.cloudPending;
+
+    if (
+      session !== current ||
+      token !== mediaEpoch
+    ) {
+      return;
+    }
+
+    current.expiresAt = result.expiresAt;
+
+    if (
+      result.status === "cancelled" ||
+      current.expiresAt <= Date.now()
+    ) {
+      throw new Error(
+        "انتهت صلاحية طلب المكالمة."
+      );
+    }
+
+    if (!timer) {
+      $("callState").textContent =
+        result.sent > 0
+          ? "تم إرسال الإشعار. في انتظار الرد…"
+          : "تم حفظ الطلب. الإشعار لم يُقبل أو الجهاز غير مسجّل؛ اطلب من الطرف الآخر فتح الموقع.";
+    }
+
+    current.timeout = setTimeout(() => {
+      if (session === current && !timer) {
+        toast(
+          "انتهت مهلة انتظار الرد. جرّب الاتصال مرة أخرى."
+        );
+
+        endCall();
+      }
+    }, Math.max(
+      0,
+      current.expiresAt - Date.now()
+    ));
+
+  } catch (error) {
+    if (current && session === current) {
+      endCall();
+    }
+
+    toast(
+      error.message ||
+      "تعذر بدء المكالمة."
+    );
+  }
+};
+
+// إعادة توصيل المستقبِل بمعرّفه الحالي بعد فتح الموقع.
+const originalHandleControl = handleControl;
+
+handleControl = async function(connection, data) {
+  if (data?.type === "cloud-ready") {
+    const current = session;
+
+    if (
+      !current?.cloudOwnerUID ||
+      current.id !== data.id ||
+      current.host !== peer?.id ||
+      current.expiresAt <= Date.now() ||
+      !await verified(connection, data)
+    ) {
+      return;
+    }
+
+    const person = await findPerson(
+      data.sender
+    );
+
+    if (
+      session !== current ||
+      person.peerId !== connection.peer ||
+      !current.invited.some(
+        item => item.uid === person.uid
+      ) ||
+      departed.has(person.peerId) ||
+      current.members.some(
+        item => item.uid === person.uid
+      )
+    ) {
+      return;
+    }
+
+    current.invited = current.invited.map(
+      item =>
+        item.uid === person.uid
+          ? person
+          : item
+    );
+
+    const members = [
+      ...new Map(
+        [
+          self(),
+          ...current.members.filter(
+            item => item.uid !== user.uid
+          ),
+          person
+        ].map(item => [item.uid, item])
+      ).values()
+    ];
+
+    send(person.peerId, {
+      type: "invite",
+      id: current.id,
+      mode: current.mode,
+      host: peer.id,
+      isGroup: current.isGroup,
+      members
+    });
+
+    return;
+  }
+
+  if (data?.type === "invite") {
+    const saved = cloudRequests.get(data.id);
+
+    if (saved) {
+      if (
+        saved.status !== "pending" ||
+        saved.expiresAt <= Date.now() ||
+        saved.host !== connection.peer ||
+        saved.callerUsername !== data.sender ||
+        cloudCallDismissed(data.id)
+      ) {
+        return;
+      }
+    }
+
+    if (
+      incoming?.id === data.id ||
+      session?.id === data.id
+    ) {
+      return;
+    }
+  }
+
+  return originalHandleControl(
+    connection,
+    data
+  );
+};
+
+async function checkCloudRequests() {
+  if (
+    cloudChecking ||
+    cloudWatchingUID !== auth.currentUser?.uid ||
+    !user ||
+    !profile ||
+    !peer?.open ||
+    user.uid !== cloudWatchingUID ||
+    !$("status").textContent?.includes(
+      "متصل وجاهز"
+    )
+  ) {
+    return;
+  }
+
+  cloudChecking = true;
+
+  const uid = cloudWatchingUID;
+  const epoch = authEpoch;
+
+  try {
+    for (const [id, request] of cloudRequests) {
+      if (
+        request.status !== "pending" ||
+        request.expiresAt <= Date.now()
+      ) {
+        if (incoming?.id === id) {
+          rejectIncoming(false);
+
+          toast(
+            "المتصل أنهى الطلب أو انتهت مهلة الرد."
+          );
+        }
+
+        if (
+          request.status === "cancelled" &&
+          session?.id === id &&
+          !session.cloudOwnerUID
+        ) {
+          endCall(false);
+        }
+
+        continue;
+      }
+
+      if (
+        session ||
+        incoming ||
+        cloudCallDismissed(id)
+      ) {
+        continue;
+      }
+
+      if (
+        Date.now() -
+        (cloudWakeTimes.get(id) || 0) <
+        10000
+      ) {
+        continue;
+      }
+
+      cloudWakeTimes.set(id, Date.now());
+
+      const caller = await findPerson(
+        request.callerUsername
+      );
+
+      if (
+        uid !== auth.currentUser?.uid ||
+        epoch !== authEpoch ||
+        !peer?.open
+      ) {
+        return;
+      }
+
+      if (
+        session ||
+        incoming ||
+        caller.uid !== request.callerUID ||
+        caller.peerId !== request.host ||
+        request.expiresAt <= Date.now()
+      ) {
+        continue;
+      }
+
+      send(caller.peerId, {
+        type: "cloud-ready",
+        id
+      });
+
+      break;
+    }
+  } catch (error) {
+    console.warn(
+      "تعذر تجهيز طلب المكالمة:",
+      error.code || error.message
+    );
+  } finally {
+    cloudChecking = false;
+  }
+}
+
+// متابعة طلبات المكالمات الخاصة بالحساب الحالي.
+onAuthStateChanged(auth, account => {
+  cloudUnsubscribe?.();
+  clearInterval(cloudInterval);
+
+  cloudUnsubscribe = null;
+  cloudInterval = null;
+
+  cloudRequests.clear();
+  cloudWakeTimes.clear();
+  cloudDismissed.clear();
+
+  cloudWatchingUID = account?.uid || null;
+
+  if (!account) return;
+
+  const requestsQuery = callQuery(
+    collection(
+      db,
+      "users",
+      account.uid,
+      "callRequests"
+    ),
+    callWhere(
+      "expiresAt",
+      ">",
+      Date.now()
+    )
+  );
+
+  cloudUnsubscribe = onSnapshot(
+    requestsQuery,
+    snapshot => {
+      if (
+        auth.currentUser?.uid !== account.uid
+      ) {
+        return;
+      }
+
+      cloudRequests.clear();
+
+      for (const item of snapshot.docs) {
+        cloudRequests.set(
+          item.id,
+          item.data()
+        );
+      }
+
+      checkCloudRequests();
+    },
+    error => {
+      toast(
+        "تعذر قراءة طلبات المكالمات. راجع قواعد callRequests."
+      );
+
+      console.warn(error.code);
+    }
+  );
+
+  cloudInterval = setInterval(
+    checkCloudRequests,
+    1000
+  );
+});
+
   
 </script>
 
