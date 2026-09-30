@@ -696,8 +696,23 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
+
+  import {
+  setPersistence as saveLoginSession,
+  browserLocalPersistence as localLoginSession
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+
 const auth = getAuth(app);
-const db = getFirestore(app);
+
+try {
+  await saveLoginSession(auth, localLoginSession);
+} catch {
+  alert(
+    "المتصفح منع حفظ الدخول. افتح الموقع في متصفح عادي واسمح بتخزين بيانات الموقع."
+  );
+}
+  
+  const db = getFirestore(app);
 
 const $ = id => document.getElementById(id);
 
@@ -3465,6 +3480,306 @@ onAuthStateChanged(auth, account => {
   );
 });
 
+
+// عرض دعوة المكالمة من الطلب المحفوظ مباشرةً.
+let directCallHandshake = null;
+const previousCloudControl = handleControl;
+
+handleControl = async function(connection, data) {
+  if (
+    data?.type === "invite" &&
+    incoming?.cloudDirect &&
+    incoming.id === data.id
+  ) {
+    const saved = cloudRequests.get(data.id);
+    const current = incoming;
+
+    if (
+      !saved ||
+      saved.status !== "pending" ||
+      saved.expiresAt <= Date.now() ||
+      saved.host !== connection.peer ||
+      data.host !== saved.host ||
+      data.sender !== saved.callerUsername ||
+      data.mode !== saved.mode ||
+      !await verified(connection, data) ||
+      !await validateMembers(data.members)
+    ) {
+      return;
+    }
+
+    if (
+      incoming !== current ||
+      !user ||
+      !peer?.open ||
+      cloudRequests.get(data.id)?.status !== "pending" ||
+      saved.expiresAt <= Date.now()
+    ) {
+      return;
+    }
+
+    if (
+      !data.members.some(person =>
+        person.uid === user.uid &&
+        person.peerId === peer.id
+      ) ||
+      !data.members.some(person =>
+        person.uid === saved.callerUID &&
+        person.peerId === saved.host
+      )
+    ) {
+      return;
+    }
+
+    incoming = {
+      ...data,
+      host: connection.peer,
+      cloudDirect: false
+    };
+
+    if (directCallHandshake?.id === data.id) {
+      directCallHandshake.resolve();
+    }
+
+    return;
+  }
+
+  return previousCloudControl(connection, data);
+};
+
+checkCloudRequests = async function() {
+  if (
+    cloudChecking ||
+    cloudWatchingUID !== auth.currentUser?.uid ||
+    !user ||
+    !profile ||
+    !peer?.open ||
+    user.uid !== cloudWatchingUID ||
+    !$("status").textContent?.includes("متصل وجاهز")
+  ) {
+    return;
+  }
+
+  cloudChecking = true;
+  const epoch = authEpoch;
+
+  try {
+    for (const [id, saved] of cloudRequests) {
+      if (
+        saved.status !== "pending" ||
+        saved.expiresAt <= Date.now()
+      ) {
+        if (incoming?.id === id) {
+          rejectIncoming(false);
+          toast("انتهى طلب المكالمة أو ألغاه المتصل.");
+        }
+
+        if (
+          saved.status === "cancelled" &&
+          session?.id === id &&
+          !session.cloudOwnerUID
+        ) {
+          endCall(false);
+        }
+
+        continue;
+      }
+
+      if (
+        session ||
+        incoming ||
+        cloudCallDismissed(id)
+      ) {
+        continue;
+      }
+
+      if (
+        Date.now() -
+        (cloudWakeTimes.get(id) || 0) < 10000
+      ) {
+        continue;
+      }
+
+      cloudWakeTimes.set(id, Date.now());
+
+      const caller = await findPerson(
+        saved.callerUsername
+      );
+
+      if (
+        epoch !== authEpoch ||
+        !user ||
+        !peer?.open
+      ) {
+        return;
+      }
+
+      if (
+        session ||
+        incoming ||
+        cloudCallDismissed(id) ||
+        saved.expiresAt <= Date.now() ||
+        cloudRequests.get(id)?.status !== "pending" ||
+        caller.uid !== saved.callerUID ||
+        caller.peerId !== saved.host
+      ) {
+        continue;
+      }
+
+      let names;
+
+      try {
+        names = JSON.parse(saved.usernames);
+      } catch {
+        continue;
+      }
+
+      if (
+        !Array.isArray(names) ||
+        !names.includes(profile.username) ||
+        !["audio", "video"].includes(saved.mode)
+      ) {
+        continue;
+      }
+
+      incoming = {
+        id,
+        type: "invite",
+        mode: saved.mode,
+        host: saved.host,
+        sender: saved.callerUsername,
+        isGroup: names.length > 1,
+        members: [caller, self()],
+        cloudDirect: true
+      };
+
+      $("incomingTitle").textContent =
+        names.length > 1
+          ? "👥 مكالمة جماعية واردة"
+          : saved.mode === "video"
+            ? "📹 مكالمة فيديو واردة"
+            : "📞 مكالمة صوتية واردة";
+
+      $("incomingText").textContent =
+        "@" + saved.callerUsername + " يتصل بك";
+
+      $("incoming").style.display = "flex";
+
+      startRing();
+
+      send(saved.host, {
+        type: "cloud-ready",
+        id
+      });
+
+      break;
+    }
+  } catch (error) {
+    console.warn(
+      "تعذر عرض طلب المكالمة:",
+      error.code || error.message
+    );
+  } finally {
+    cloudChecking = false;
+  }
+};
+
+// تأكيد اتصال المتصل قبل بدء الصوت أو الفيديو.
+const acceptSavedCall = $("accept").onclick;
+
+$("accept").onclick = async function(event) {
+  if (!incoming?.cloudDirect) {
+    return acceptSavedCall.call(this, event);
+  }
+
+  const id = incoming.id;
+  const saved = cloudRequests.get(id);
+
+  if (
+    !saved ||
+    saved.status !== "pending" ||
+    saved.expiresAt <= Date.now()
+  ) {
+    rejectIncoming(false);
+    toast("انتهت مهلة الرد. اطلب مكالمة جديدة.");
+    return;
+  }
+
+  $("accept").disabled = true;
+  $("incomingText").textContent =
+    "جاري تجهيز الاتصال…";
+
+  let waitTimer;
+
+  try {
+    await new Promise((resolve, reject) => {
+      directCallHandshake = { id, resolve };
+
+      waitTimer = setTimeout(
+        () => reject(new Error(
+          "المتصل لم يعد متصلًا، أو تعذر الاتصال بين الشبكتين. جرّبا فتح الموقع معًا."
+        )),
+        Math.min(
+          15000,
+          saved.expiresAt - Date.now()
+        )
+      );
+
+      try {
+        send(saved.host, {
+          type: "cloud-ready",
+          id
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    if (
+      incoming?.id !== id ||
+      cloudRequests.get(id)?.status !== "pending" ||
+      saved.expiresAt <= Date.now()
+    ) {
+      throw new Error(
+        "تم إلغاء المكالمة أو انتهت مهلة الرد."
+      );
+    }
+
+    return await acceptSavedCall.call(this, event);
+
+  } catch (error) {
+    if (incoming?.id === id) {
+      rejectIncoming(false);
+    }
+
+    toast(error.message || "تعذر قبول المكالمة.");
+
+  } finally {
+    clearTimeout(waitTimer);
+
+    if (directCallHandshake?.id === id) {
+      directCallHandshake = null;
+    }
+
+    $("accept").disabled = false;
+  }
+};
+
+// فحص الطلبات بعد استعادة الحساب وتجهيز الاتصال.
+onAuthStateChanged(auth, account => {
+  clearInterval(cloudInterval);
+
+  cloudInterval = account
+    ? setInterval(() => checkCloudRequests(), 1000)
+    : null;
+});
+
+window.addEventListener(
+  "focus",
+  () => checkCloudRequests()
+);
+
+  
   
 </script>
 
