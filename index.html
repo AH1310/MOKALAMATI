@@ -2731,6 +2731,189 @@ window.addEventListener(
   }
 );
 
+// تفعيل إشعارات مكالماتي
+import {
+  getMessaging,
+  getToken,
+  deleteToken,
+  isSupported,
+  onMessage
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-messaging.js";
+
+import {
+  beforeAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+
+const pushButton = document.getElementById("enableNotifications");
+
+const pushVapidKey =
+  "BJUTtALdb8lZOajOY9GrTdAYkstiCBPkNzw67pQKTx6-xgHTRMpPUpT2FhAElVOpWAqiUE0vvyT0qTF0KNghK9s";
+
+let pushMessaging = null;
+let pushTask = null;
+let savedPushRef = null;
+
+const pushReady = isSupported().then(supported => {
+  if (!supported) return false;
+
+  pushMessaging = getMessaging(app);
+
+  // عرض الرسائل أثناء فتح الموقع
+  onMessage(pushMessaging, payload => {
+    const title =
+      payload.notification?.title ||
+      payload.data?.title ||
+      "مكالماتي";
+
+    const body =
+      payload.notification?.body ||
+      payload.data?.body ||
+      "لديك إشعار جديد";
+
+    const notice = document.createElement("div");
+    notice.textContent = title + " — " + body;
+    notice.style.cssText =
+      "position:fixed;bottom:20px;left:16px;right:16px;" +
+      "background:#2563eb;color:white;padding:16px;" +
+      "border-radius:12px;z-index:9999;text-align:center;";
+
+    document.body.appendChild(notice);
+    setTimeout(() => notice.remove(), 8000);
+  });
+
+  return true;
+}).catch(() => false);
+
+// إلغاء تسجيل الجهاز عند الخروج أو تبديل الحساب
+beforeAuthStateChanged(auth, async nextUser => {
+  const previousUser = auth.currentUser;
+
+  if (!previousUser || previousUser.uid === nextUser?.uid) {
+    return;
+  }
+
+  if (pushTask) {
+    await pushTask.catch(() => {});
+  }
+
+  if (await pushReady) {
+    await deleteToken(pushMessaging);
+
+    if (savedPushRef) {
+      await deleteDoc(savedPushRef).catch(() => {});
+      savedPushRef = null;
+    }
+  }
+});
+
+async function registerPushDevice(user, permissionPromise) {
+  const permission = await permissionPromise;
+
+  if (permission !== "granted") {
+    throw new Error("لم يتم السماح بالإشعارات.");
+  }
+
+  if (!(await pushReady)) {
+    throw new Error("المتصفح لا يدعم إشعارات Firebase.");
+  }
+
+  const registration = await navigator.serviceWorker.register(
+    "/MOKALAMATI/firebase-messaging-sw.js",
+    { scope: "/MOKALAMATI/" }
+  );
+
+  await navigator.serviceWorker.ready;
+
+  const token = await getToken(pushMessaging, {
+    vapidKey: pushVapidKey,
+    serviceWorkerRegistration: registration
+  });
+
+  if (!token) {
+    throw new Error("تعذر تسجيل الجهاز. حاول مرة أخرى.");
+  }
+
+  if (auth.currentUser?.uid !== user.uid) {
+    await deleteToken(pushMessaging);
+    throw new Error("سجّل الدخول مرة أخرى ثم فعّل الإشعارات.");
+  }
+
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(token)
+  );
+
+  const tokenId = Array.from(new Uint8Array(hash))
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+  savedPushRef = doc(db, "users", user.uid, "pushTokens", tokenId);
+
+  await setDoc(savedPushRef, {
+    token,
+    updatedAt: serverTimestamp()
+  });
+
+  pushButton.textContent = "✅ الجهاز مسجّل للإشعارات";
+  alert("تم تسجيل الجهاز. باقي ربط إرسال إشعارات المكالمات.");
+}
+
+if (pushButton) {
+  pushButton.onclick = async () => {
+    const user = auth.currentUser;
+
+    if (!user) {
+      alert("سجّل الدخول أولًا.");
+      return;
+    }
+
+    const isAppleMobile =
+      /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === "MacIntel" &&
+       navigator.maxTouchPoints > 1);
+
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      navigator.standalone === true;
+
+    if (isAppleMobile && !isStandalone) {
+      alert(
+        "افتح الموقع في Safari، ثم مشاركة ← إضافة إلى الشاشة الرئيسية." +
+        " افتحه من الأيقونة الجديدة وفعّل الإشعارات."
+      );
+      return;
+    }
+
+    if (!("Notification" in window) ||
+        !("serviceWorker" in navigator)) {
+      alert("هذا المتصفح لا يدعم الإشعارات.");
+      return;
+    }
+
+    if (Notification.permission === "denied") {
+      alert("اسمح بإشعارات الموقع من إعدادات الجهاز أو المتصفح.");
+      return;
+    }
+
+    // طلب الإذن مباشرة بعد الضغط على الزر
+    const permissionPromise = Notification.requestPermission();
+
+    pushButton.disabled = true;
+    pushButton.textContent = "جارٍ تسجيل الجهاز…";
+
+    try {
+      pushTask = registerPushDevice(user, permissionPromise);
+      await pushTask;
+    } catch (error) {
+      pushButton.textContent = "🔔 تفعيل الإشعارات";
+      alert(error.message || "تعذر التفعيل. حاول مرة أخرى.");
+    } finally {
+      pushTask = null;
+      pushButton.disabled = false;
+    }
+  };
+}
+  
 </script>
 
 </body>
