@@ -2919,56 +2919,6 @@ if (pushButton) {
 }
 
 
-const testPushButton = document.createElement("button");
-testPushButton.textContent = "🔔 اختبار الإشعارات";
-testPushButton.style.cssText =
-  "display:block;margin:12px auto;padding:12px 20px;" +
-  "background:#2563eb;color:white;border:0;border-radius:10px;" +
-  "font-size:16px;cursor:pointer";
-
-document.body.appendChild(testPushButton);
-
-testPushButton.onclick = async () => {
-  if (!auth.currentUser) {
-    alert("سجّل الدخول أولًا.");
-    return;
-  }
-
-  testPushButton.disabled = true;
-  testPushButton.textContent = "جارٍ الإرسال…";
-
-  try {
-    const idToken = await auth.currentUser.getIdToken();
-
-    const response = await fetch(
-      "https://little-poetry-7913mokalamati-notifications.ah10med2013.workers.dev/test",
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + idToken
-        }
-      }
-    );
-
-    const result = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        (result.error || result.message || "تعذر الإرسال.") +
-        (result.failures?.length
-          ? "\n" + result.failures.join(", ")
-          : "")
-      );
-    }
-
-    alert("Firebase قبل الإرسال. تحقق من ظهور الإشعار.");
-  } catch (error) {
-    alert(error.message || "تعذر الاتصال بالخدمة.");
-  } finally {
-    testPushButton.disabled = false;
-    testPushButton.textContent = "🔔 اختبار الإشعارات";
-  }
-};
 
 // ربط المكالمات بطلبات Firestore وإشعارات Cloudflare.
 import {
