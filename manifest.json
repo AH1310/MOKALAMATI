@@ -1,0 +1,12 @@
+{
+  "id": "/MOKALAMATI/",
+  "name": "مكالماتي",
+  "short_name": "مكالماتي",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/MOKALAMATI/",
+  "scope": "/MOKALAMATI/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#1e293b"
+}
